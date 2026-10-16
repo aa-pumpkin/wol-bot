@@ -24,6 +24,20 @@ unsigned long lastTelegramPoll = 0;
 
 bool wifiWasConnected = false;
 bool udpReady = false;
+bool commandsRegistered = false;
+
+const char* const wakeButton = "⚡ Wake PC";
+const char* const statusButton = "📊 Status";
+
+// Persistent keyboard under the message box.
+const char* const mainKeyboard =
+    "[[\"⚡ Wake PC\"],[\"📊 Status\"]]";
+
+// Commands shown in Telegram's "Menu" button.
+const char* const botCommands =
+    "[{\"command\":\"wake\",\"description\":\"Turn on the PC\"},"
+    "{\"command\":\"status\",\"description\":\"Check the bot\"},"
+    "{\"command\":\"help\",\"description\":\"What I can do\"}]";
 
 bool intervalPassed(
     unsigned long now,
@@ -132,7 +146,13 @@ bool sendTelegramMessage(const String& chatId, const String& text) {
         return false;
     }
 
-    const bool result = bot.sendMessage(chatId, text, "");
+    const bool result = bot.sendMessageWithReplyKeyboard(
+        chatId,
+        text,
+        "HTML",
+        mainKeyboard,
+        true
+    );
 
     Serial.print("Telegram send: ");
     Serial.println(result ? "OK" : "FAILED");
@@ -200,22 +220,81 @@ bool sendMagicPacket() {
     return sentAtLeastOnce;
 }
 
+String signalQuality(long rssi) {
+    if (rssi >= -60) {
+        return "excellent";
+    }
+
+    if (rssi >= -70) {
+        return "good";
+    }
+
+    if (rssi >= -80) {
+        return "fair";
+    }
+
+    return "weak";
+}
+
+String formatUptime(unsigned long ms) {
+    const unsigned long minutes = ms / 60000UL;
+    const unsigned long days = minutes / 1440UL;
+    const unsigned long hours = (minutes / 60UL) % 24UL;
+
+    if (days > 0) {
+        return String(days) + " d " + String(hours) + " h";
+    }
+
+    if (hours > 0) {
+        return String(hours) + " h " + String(minutes % 60UL) + " min";
+    }
+
+    return String(minutes) + " min";
+}
+
+void sendHelp(const String& chatId) {
+    sendTelegramMessage(
+        chatId,
+        "👋 <b>Hi! I turn on your PC.</b>\n"
+        "\n"
+        "⚡ <b>Wake PC</b> — turn it on\n"
+        "📊 <b>Status</b> — check that I'm online\n"
+        "\n"
+        "Use the buttons below or the Menu."
+    );
+}
+
+void sendWake(const String& chatId) {
+    const bool sent = sendMagicPacket();
+
+    sendTelegramMessage(
+        chatId,
+        sent
+            ? "⚡ <b>Wake-up signal sent.</b>\n"
+              "The PC should be ready in about a minute."
+            : "❌ <b>Couldn't send the wake-up signal.</b>\n"
+              "Try again in a few seconds."
+    );
+}
+
 void sendStatus(const String& chatId) {
-    String status = "ESP32 is online.";
+    const long rssi = WiFi.RSSI();
 
-    status += "\nIP: ";
+    String status = "🟢 <b>Bot is online</b>\n\n";
+
+    status += "📶 Wi-Fi: ";
+    status += signalQuality(rssi);
+    status += " (";
+    status += String(rssi);
+    status += " dBm)\n";
+
+    status += "⏱ Up for: ";
+    status += formatUptime(millis());
+    status += "\n";
+
+    status += "🌐 IP: <code>";
     status += WiFi.localIP().toString();
-
-    status += "\nWi-Fi signal: ";
-    status += String(WiFi.RSSI());
-    status += " dBm";
-
-    status += "\nUptime: ";
-    status += String(millis() / 3600000UL);
-    status += " h";
-
-    status += "\nBroadcast: ";
-    status += getBroadcastAddress().toString();
+    status += "</code>";
 
     sendTelegramMessage(chatId, status);
 }
@@ -239,27 +318,17 @@ void handleMessages(int messageCount) {
             continue;
         }
 
-        if (text == "/wake") {
-            const bool sent = sendMagicPacket();
-
-            sendTelegramMessage(
-                chatId,
-                sent
-                    ? "Magic packet sent to the PC."
-                    : "Failed to send the magic packet."
-            );
-        } else if (text == "/status") {
+        if (text == "/wake" || text == wakeButton) {
+            sendWake(chatId);
+        } else if (text == "/status" || text == statusButton) {
             sendStatus(chatId);
         } else if (text == "/start" || text == "/help") {
+            sendHelp(chatId);
+        } else {
             sendTelegramMessage(
                 chatId,
-                "Commands:\n"
-                "/wake - turn on the PC\n"
-                "/status - show ESP32 status\n"
-                "/help - show commands"
+                "🤔 I don't know that one. Use the buttons below."
             );
-        } else {
-            Serial.println("Unknown command ignored.");
         }
     }
 }
@@ -267,6 +336,13 @@ void handleMessages(int messageCount) {
 void checkTelegram() {
     if (WiFi.status() != WL_CONNECTED) {
         return;
+    }
+
+    if (!commandsRegistered) {
+        commandsRegistered = bot.setMyCommands(botCommands);
+
+        Serial.print("Telegram commands: ");
+        Serial.println(commandsRegistered ? "OK" : "FAILED");
     }
 
     int messageCount =
