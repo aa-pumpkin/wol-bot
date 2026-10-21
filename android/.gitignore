@@ -1,0 +1,11 @@
+.gradle/
+.kotlin/
+build/
+local.properties
+# Written by tools/widget_secret.py, holds the widget key
+secrets.properties
+
+# Android SDK and Gradle cache, kept inside the project
+.sdk/
+.gradle-home/
+.jdk/

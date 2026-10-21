@@ -3,12 +3,18 @@
 #include <WiFiClientSecure.h>
 #include <WiFiUdp.h>
 #include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+#include <mbedtls/md.h>
+#include <time.h>
 
 #include "secrets.h"
 
 WiFiClientSecure secureClient;
 UniversalTelegramBot bot(BOT_TOKEN, secureClient);
 WiFiUDP udp;
+
+// Separate connection that stays open to ntfy.sh for the Android widget.
+WiFiClientSecure ntfyClient;
 
 const uint8_t targetMac[6] = {
     0x88, 0xAE, 0xDD, 0x12, 0x33, 0x2A
@@ -19,8 +25,23 @@ const uint16_t wolPort = 9;
 const unsigned long wifiRetryInterval = 10000UL;
 const unsigned long telegramPollInterval = 2000UL;
 
+const char* const ntfyHost = "ntfy.sh";
+const unsigned long ntfyRetryInterval = 15000UL;
+// ntfy sends a keepalive every 45 s, so silence this long means a dead link.
+const unsigned long ntfyIdleTimeout = 120000UL;
+const size_t ntfyMaxLine = 1024;
+// How old a signed widget message may be, in seconds.
+const long widgetMaxAge = 120;
+
 unsigned long lastWifiAttempt = 0;
 unsigned long lastTelegramPoll = 0;
+unsigned long lastNtfyAttempt = 0;
+unsigned long lastNtfyData = 0;
+
+bool ntfyHeadersDone = false;
+String ntfyLine;
+String ntfyLastId;
+long long lastWidgetTime = 0;
 
 bool wifiWasConnected = false;
 bool udpReady = false;
@@ -114,9 +135,14 @@ void handleWifi() {
         Serial.println(" dBm");
 
         secureClient.stop();
+        ntfyClient.stop();
         initializeUdp();
 
+        // The widget messages are checked against real time.
+        configTime(0, 0, "pool.ntp.org", "time.google.com");
+
         lastTelegramPoll = 0;
+        lastNtfyAttempt = millis() - ntfyRetryInterval;
         return;
     }
 
@@ -126,6 +152,7 @@ void handleWifi() {
 
         udp.stop();
         secureClient.stop();
+        ntfyClient.stop();
 
         Serial.println();
         Serial.println("Wi-Fi connection lost.");
@@ -299,6 +326,214 @@ void sendStatus(const String& chatId) {
     sendTelegramMessage(chatId, status);
 }
 
+bool widgetSignatureValid(const String& data, const String& signature) {
+    uint8_t mac[32];
+
+    const int result = mbedtls_md_hmac(
+        mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+        reinterpret_cast<const uint8_t*>(WIDGET_KEY),
+        strlen(WIDGET_KEY),
+        reinterpret_cast<const uint8_t*>(data.c_str()),
+        data.length(),
+        mac
+    );
+
+    if (result != 0 || signature.length() != sizeof(mac) * 2) {
+        return false;
+    }
+
+    char expected[sizeof(mac) * 2 + 1];
+
+    for (size_t i = 0; i < sizeof(mac); i++) {
+        snprintf(expected + i * 2, 3, "%02x", mac[i]);
+    }
+
+    // Constant-time compare.
+    uint8_t difference = 0;
+
+    for (size_t i = 0; i < sizeof(mac) * 2; i++) {
+        difference |= expected[i] ^ signature[i];
+    }
+
+    return difference == 0;
+}
+
+/*
+ * Widget message: "wake <unix time> <hex HMAC-SHA256 of "wake:<unix time>">".
+ * Only fresh, correctly signed and never seen before messages wake the PC.
+ */
+void handleWidgetMessage(const String& message) {
+    const int firstSpace = message.indexOf(' ');
+    const int secondSpace = message.indexOf(' ', firstSpace + 1);
+
+    if (
+        firstSpace < 0 ||
+        secondSpace < 0 ||
+        message.substring(0, firstSpace) != "wake"
+    ) {
+        Serial.println("Widget: unknown message ignored.");
+        return;
+    }
+
+    const String timeText = message.substring(firstSpace + 1, secondSpace);
+    const String signature = message.substring(secondSpace + 1);
+
+    if (timeText.length() == 0 || timeText.length() > 12) {
+        Serial.println("Widget: bad time ignored.");
+        return;
+    }
+
+    for (size_t i = 0; i < timeText.length(); i++) {
+        if (!isDigit(timeText[i])) {
+            Serial.println("Widget: bad time ignored.");
+            return;
+        }
+    }
+
+    if (!widgetSignatureValid("wake:" + timeText, signature)) {
+        Serial.println("Widget: bad signature ignored.");
+        return;
+    }
+
+    const time_t now = time(nullptr);
+
+    if (now < 1700000000) {
+        Serial.println("Widget: clock not synced yet, ignored.");
+        return;
+    }
+
+    const long long sentAt = atoll(timeText.c_str());
+
+    if (llabs(static_cast<long long>(now) - sentAt) > widgetMaxAge) {
+        Serial.println("Widget: message too old, ignored.");
+        return;
+    }
+
+    if (sentAt <= lastWidgetTime) {
+        Serial.println("Widget: repeated message ignored.");
+        return;
+    }
+
+    lastWidgetTime = sentAt;
+
+    Serial.println("Widget: wake request accepted.");
+
+    const bool sent = sendMagicPacket();
+
+    sendTelegramMessage(
+        ALLOWED_CHAT_ID,
+        sent
+            ? "⚡ <b>Wake-up signal sent from the widget.</b>\n"
+              "The PC should be ready in about a minute."
+            : "❌ <b>The widget asked to wake the PC,</b>\n"
+              "but the signal couldn't be sent."
+    );
+}
+
+void handleNtfyLine(const String& line) {
+    JsonDocument doc;
+
+    if (deserializeJson(doc, line)) {
+        return;
+    }
+
+    const char* event = doc["event"] | "";
+
+    if (strcmp(event, "message") != 0) {
+        return;
+    }
+
+    ntfyLastId = doc["id"] | "";
+    handleWidgetMessage(doc["message"] | "");
+}
+
+void connectNtfy() {
+    lastNtfyAttempt = millis();
+    ntfyClient.stop();
+
+    if (!ntfyClient.connect(ntfyHost, 443)) {
+        Serial.println("ntfy: connection failed.");
+        return;
+    }
+
+    /*
+     * HTTP/1.0 keeps the stream free of chunked encoding: one JSON
+     * object per line. After a reconnect "since" fetches anything
+     * sent while the link was down.
+     */
+    String path = "/" WIDGET_TOPIC "/json";
+
+    if (ntfyLastId.length() > 0) {
+        path += "?since=" + ntfyLastId;
+    }
+
+    ntfyClient.print(
+        "GET " + path + " HTTP/1.0\r\n"
+        "Host: " + String(ntfyHost) + "\r\n"
+        "User-Agent: wol-bot\r\n"
+        "\r\n"
+    );
+
+    ntfyHeadersDone = false;
+    ntfyLine = "";
+    lastNtfyData = millis();
+
+    Serial.println("ntfy: listening for the widget.");
+}
+
+void handleNtfy() {
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+
+    if (!ntfyClient.connected()) {
+        if (intervalPassed(millis(), lastNtfyAttempt, ntfyRetryInterval)) {
+            connectNtfy();
+        }
+
+        return;
+    }
+
+    while (ntfyClient.available() > 0) {
+        const char c = static_cast<char>(ntfyClient.read());
+        lastNtfyData = millis();
+
+        if (c == '\r') {
+            continue;
+        }
+
+        if (c != '\n') {
+            if (ntfyLine.length() < ntfyMaxLine) {
+                ntfyLine += c;
+            }
+
+            continue;
+        }
+
+        if (!ntfyHeadersDone) {
+            if (ntfyLine.startsWith("HTTP/") && ntfyLine.indexOf(" 200") < 0) {
+                Serial.print("ntfy: unexpected response: ");
+                Serial.println(ntfyLine);
+                ntfyClient.stop();
+                return;
+            }
+
+            if (ntfyLine.length() == 0) {
+                ntfyHeadersDone = true;
+            }
+        } else {
+            handleNtfyLine(ntfyLine);
+        }
+
+        ntfyLine = "";
+    }
+
+    if (intervalPassed(millis(), lastNtfyData, ntfyIdleTimeout)) {
+        Serial.println("ntfy: link went quiet, reconnecting.");
+        ntfyClient.stop();
+    }
+}
+
 void handleMessages(int messageCount) {
     for (int i = 0; i < messageCount; i++) {
         String chatId = bot.messages[i].chat_id;
@@ -389,6 +624,9 @@ void setup() {
     secureClient.setInsecure();
     secureClient.setTimeout(10000);
 
+    ntfyClient.setInsecure();
+    ntfyClient.setTimeout(10000);
+
     bot.longPoll = 0;
 
     configureWifi();
@@ -410,6 +648,8 @@ void loop() {
         checkTelegram();
         lastTelegramPoll = millis();
     }
+
+    handleNtfy();
 
     delay(20);
 }
