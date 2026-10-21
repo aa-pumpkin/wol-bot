@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Wake PC</string>
+    <string name="widget_name">Wake PC</string>
+    <string name="widget_description">Turn on the PC with one tap</string>
+</resources>

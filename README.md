@@ -15,6 +15,24 @@ Send `/start` and two buttons appear under the message box:
 The commands are also in Telegram's **Menu** button. The bot only replies to
 the chat ID set in `ALLOWED_CHAT_ID` and ignores everyone else.
 
+## Android widget
+
+The `android/` app adds a one-tap **Wake PC** widget that follows the phone's
+system colors (Material You). It works from anywhere: the widget posts a signed
+message to a private [ntfy.sh](https://ntfy.sh) topic, the ESP keeps a
+connection to that topic open and wakes the PC. The message is signed with a
+shared key and expires after two minutes, so knowing the topic isn't enough to
+wake the PC. Every wake from the widget is also reported in Telegram.
+
+```sh
+python3 tools/widget_secret.py   # adds WIDGET_TOPIC/WIDGET_KEY to secrets.h
+pio run -t upload                # flash the ESP with the new secret
+cd android && ./gradlew installDebug
+```
+
+The build needs an Android SDK (`sdk.dir` in `android/local.properties`) and a
+JDK 17+.
+
 ## Setup
 
 1. Copy `include/secrets.h.example` to `include/secrets.h` and fill in your
