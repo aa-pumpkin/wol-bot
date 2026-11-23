@@ -16,9 +16,7 @@ WiFiUDP udp;
 // Separate connection that stays open to ntfy.sh for the Android widget.
 WiFiClientSecure ntfyClient;
 
-const uint8_t targetMac[6] = {
-    0x88, 0xAE, 0xDD, 0x12, 0x33, 0x2A
-};
+const uint8_t targetMac[6] = TARGET_MAC;
 
 const uint16_t wolPort = 9;
 
